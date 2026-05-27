@@ -2,13 +2,6 @@ const CLIENT_PREFIX = "client:";
 const UUID_RE = /\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/g;
 const CLIENT_ID_RE = /^[a-zA-Z0-9_-]{6,80}$/;
 const SUB_FORMATS = new Set(["raw", "ty", "cl", "sb", "bl"]);
-const DEFAULT_OUTPUTS = {
-  raw: true,
-  ty: true,
-  cl: true,
-  sb: true,
-  bl: true,
-};
 
 export default {
   async fetch(request, env) {
@@ -17,10 +10,9 @@ export default {
 
       const url = new URL(request.url);
       const path = normalizePath(url.pathname);
-      const adminPath = normalizeAdminPath(env.ADMIN_PATH || "/admin");
 
       if (request.method === "GET" && path === "/") {
-        return redirect(adminPath);
+        return redirect("/admin");
       }
 
       if (request.method === "GET" && path.startsWith("/client/")) {
@@ -34,20 +26,20 @@ export default {
         return handleSubscription(parsed.clientId, parsed.format, env);
       }
 
-      if (isAdminRoute(path, adminPath)) {
+      if (path === "/admin" || path === "/admin/save" || path === "/admin/delete") {
         const authResponse = requireAdmin(request, env);
         if (authResponse) return authResponse;
 
-        if (request.method === "GET" && path === adminPath) {
-          return handleAdminPage(request, env, adminPath);
+        if (request.method === "GET" && path === "/admin") {
+          return handleAdminPage(request, env);
         }
 
-        if (request.method === "POST" && path === `${adminPath}/save`) {
-          return handleSaveClient(request, env, adminPath);
+        if (request.method === "POST" && path === "/admin/save") {
+          return handleSaveClient(request, env);
         }
 
-        if (request.method === "POST" && path === `${adminPath}/delete`) {
-          return handleDeleteClient(request, env, adminPath);
+        if (request.method === "POST" && path === "/admin/delete") {
+          return handleDeleteClient(request, env);
         }
       }
 
@@ -62,30 +54,28 @@ function assertBindings(env) {
   if (!env.SUB_DB) {
     throw new Error("Missing KV binding: SUB_DB");
   }
+
+  if (!env.ADMIN_PASS) {
+    throw new Error("Missing required secret: ADMIN_PASS");
+  }
 }
 
 function normalizePath(pathname) {
-  if (pathname.length > 1 && pathname.endsWith("/")) return pathname.slice(0, -1);
+  if (pathname.length > 1 && pathname.endsWith("/")) {
+    return pathname.slice(0, -1);
+  }
   return pathname;
-}
-
-function normalizeAdminPath(value) {
-  let path = String(value || "/admin").trim();
-  if (!path.startsWith("/")) path = `/${path}`;
-  return normalizePath(path);
-}
-
-function isAdminRoute(path, adminPath) {
-  return path === adminPath || path === `${adminPath}/save` || path === `${adminPath}/delete`;
 }
 
 function parseSubPath(path) {
   const rest = path.slice("/sub/".length);
   const parts = rest.split("/").map((part) => decodeURIComponent(part.trim())).filter(Boolean);
+
   if (parts.length < 1 || parts.length > 2) return null;
 
   const clientId = parts[0];
   const format = parts[1] || "raw";
+
   if (!isValidClientId(clientId)) return null;
   if (!SUB_FORMATS.has(format)) return null;
 
@@ -93,14 +83,21 @@ function parseSubPath(path) {
 }
 
 async function handleSubscription(clientId, format, env) {
-  if (!isValidClientId(clientId)) return textResponse("Invalid client link", 400);
+  if (!isValidClientId(clientId)) {
+    return textResponse("Invalid client link", 400);
+  }
 
   const client = await getClient(env, clientId);
-  if (!client) return textResponse("Client not found", 404);
-  if (!client.enabled) return textResponse("Subscription disabled", 403);
+  if (!client) {
+    return textResponse("Client not found", 404);
+  }
 
-  if (!isOutputEnabled(client, format)) {
-    return textResponse(`This output is disabled for this client: ${format}`, 403);
+  if (!client.enabled) {
+    return textResponse("Subscription disabled", 403);
+  }
+
+  if (!isFormatEnabled(client, format)) {
+    return textResponse(`Subscription format disabled: ${format}`, 403);
   }
 
   const upstream = await fetchUpstreamInfo(client.upstreamUrl);
@@ -176,6 +173,7 @@ function buildSubscriptionHeaders({
   supportedProxyCount,
 }) {
   const headers = new Headers();
+
   headers.set("Content-Type", contentType);
   headers.set("Cache-Control", "no-store, no-cache, must-revalidate");
   headers.set("Subscription-Userinfo", userInfo);
@@ -191,19 +189,26 @@ function buildSubscriptionHeaders({
   headers.set("X-EdgeSub-Replaced-UUID-Count", String(replacementStats.totalUuidMatches));
   headers.set("X-EdgeSub-Distinct-Input-UUIDs", replacementStats.distinctInputUuids.join(",") || "none");
   headers.set("X-EdgeSub-Supported-Proxy-Count", String(supportedProxyCount || 0));
+  headers.set("X-EdgeSub-Worker-Replacement", client.workerReplaceEnabled ? "enabled" : "disabled");
+  headers.set("X-EdgeSub-Worker-Count", String(getClientWorkerAddresses(client).length));
 
-  if (upstream.webPageUrl) headers.set("Profile-Web-Page-Url", upstream.webPageUrl);
+  if (upstream.webPageUrl) {
+    headers.set("Profile-Web-Page-Url", upstream.webPageUrl);
+  }
+
   return headers;
 }
 
 async function fetchUpstreamInfo(upstreamUrl) {
-  if (!upstreamUrl) return { userInfo: "", webPageUrl: "" };
+  if (!upstreamUrl) {
+    return { userInfo: "", webPageUrl: "" };
+  }
 
   try {
     const response = await fetch(upstreamUrl, {
       method: "GET",
       headers: {
-        "User-Agent": "EdgeSub-Worker/1.0",
+        "User-Agent": "EdgeSub-Subscription-Worker/1.0",
         "Accept": "text/plain,*/*;q=0.8",
       },
       cf: {
@@ -218,7 +223,11 @@ async function fetchUpstreamInfo(upstreamUrl) {
       status: response.status,
     };
   } catch (error) {
-    return { userInfo: "", webPageUrl: "", error: error.message };
+    return {
+      userInfo: "",
+      webPageUrl: "",
+      error: error.message,
+    };
   }
 }
 
@@ -241,22 +250,159 @@ function buildClientConfigs(client, parsedInfo, options = {}) {
 function buildManualConfigLines(client) {
   const effectiveUuid = getEffectiveClientUuid(client);
   const manualConfigText = replaceUuidsInText(String(client.configs || ""), effectiveUuid);
-
-  return manualConfigText
+  const manualConfigs = manualConfigText
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
+
+  if (!client.workerReplaceEnabled) {
+    return manualConfigs;
+  }
+
+  const workers = getClientWorkerAddresses(client);
+  if (workers.length === 0) {
+    return manualConfigs;
+  }
+
+  const expanded = [];
+  for (const worker of workers) {
+    for (const config of manualConfigs) {
+      expanded.push(replaceWorkerInConfig(config, worker));
+    }
+  }
+
+  return expanded;
+}
+
+function getClientWorkerAddresses(client) {
+  return parseWorkerAddresses(client.workerAddresses || client.workers || "");
+}
+
+function parseWorkerAddresses(value) {
+  return [...new Set(
+    String(value || "")
+      .split(",")
+      .map((item) => normalizeWorkerAddress(item))
+      .filter(Boolean)
+  )];
+}
+
+function normalizeWorkerAddress(value) {
+  let worker = String(value || "").trim();
+  if (!worker) return "";
+
+  try {
+    const parsed = new URL(worker.includes("://") ? worker : `https://${worker}`);
+    worker = parsed.hostname;
+  } catch {
+    worker = worker.split("/")[0];
+  }
+
+  worker = worker.trim().replace(/^\.+|\.+$/g, "").toLowerCase();
+  if (!/^[a-z0-9.-]+$/.test(worker)) return "";
+  if (!worker.includes(".")) return "";
+
+  return worker;
+}
+
+function detectWorkerAddressesFromConfigs(configText) {
+  const detected = [];
+  const lines = String(configText || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  for (const line of lines) {
+    for (const worker of detectWorkersFromConfig(line)) {
+      if (!detected.includes(worker)) detected.push(worker);
+    }
+  }
+
+  return detected;
+}
+
+function detectWorkersFromConfig(config) {
+  const detected = [];
+  const scheme = String(config).split("://", 1)[0].toLowerCase();
+
+  if (scheme === "vless" || scheme === "trojan") {
+    try {
+      const parsed = parseUrlLikeConfig(config);
+      for (const key of ["sni", "host"]) {
+        const value = normalizeWorkerAddress(parsed.params.get(key) || "");
+        if (value && !detected.includes(value)) detected.push(value);
+      }
+    } catch {
+      return detected;
+    }
+  }
+
+  return detected;
+}
+
+function replaceWorkerInConfig(config, workerAddress) {
+  const worker = normalizeWorkerAddress(workerAddress);
+  if (!worker) return config;
+
+  const scheme = String(config).split("://", 1)[0].toLowerCase();
+  if (scheme !== "vless" && scheme !== "trojan") return config;
+
+  try {
+    const parsed = parseUrlLikeConfig(config);
+
+    // Match the Python replacer behavior: only replace keys that already exist.
+    if (parsed.params.has("sni")) parsed.params.set("sni", worker);
+    if (parsed.params.has("host")) parsed.params.set("host", worker);
+
+    return rebuildUrlLikeConfig(parsed);
+  } catch {
+    return config;
+  }
+}
+
+function parseUrlLikeConfig(config) {
+  const scheme = config.split("://", 1)[0].toLowerCase();
+  const body = config.split("://", 2)[1] || "";
+  const [mainPart, rawRemark = ""] = body.split("#", 2);
+
+  if (!mainPart.includes("@")) {
+    throw new Error("URL-like config missing @");
+  }
+
+  const [auth, rest] = mainPart.split("@", 2);
+  const url = new URL(`https://${rest}`);
+
+  return {
+    scheme,
+    auth,
+    url,
+    params: url.searchParams,
+    rawRemark,
+  };
+}
+
+function rebuildUrlLikeConfig(parsed) {
+  const query = parsed.params.toString();
+  const host = parsed.url.host;
+  const pathname = parsed.url.pathname || "";
+  const search = query ? `?${query}` : "";
+  const hash = parsed.rawRemark ? `#${parsed.rawRemark}` : "";
+
+  return `${parsed.scheme}://${parsed.auth}@${host}${pathname}${search}${hash}`;
 }
 
 function getEffectiveClientUuid(client) {
   // Only the explicit Client UUID box controls UUID replacement.
-  // If Client UUID is empty, manual configs stay untouched even if upstreamUrl is filled.
+  // If Client UUID is empty, manual configs stay untouched even if the sub link is filled.
   if (isValidUuid(client.uuid)) return client.uuid;
   return "";
 }
 
 function replaceUuidsInText(text, targetUuid) {
-  if (!isValidUuid(targetUuid)) return text;
+  if (!isValidUuid(targetUuid)) {
+    return text;
+  }
+
   return String(text).replace(UUID_RE, targetUuid);
 }
 
@@ -269,6 +415,38 @@ function getUuidReplacementStats(text, targetUuid) {
     totalUuidMatches: isValidUuid(targetUuid) ? matches.length : 0,
     distinctInputUuids,
   };
+}
+
+function normalizeAllowedFormats(client) {
+  const saved = client && typeof client.allowedFormats === "object" && client.allowedFormats
+    ? client.allowedFormats
+    : null;
+
+  return {
+    raw: saved && typeof saved.raw === "boolean" ? saved.raw : true,
+    ty: saved && typeof saved.ty === "boolean" ? saved.ty : true,
+    cl: saved && typeof saved.cl === "boolean" ? saved.cl : true,
+    sb: saved && typeof saved.sb === "boolean" ? saved.sb : true,
+    bl: saved && typeof saved.bl === "boolean" ? saved.bl : true,
+  };
+}
+
+function isFormatEnabled(client, format) {
+  const allowed = normalizeAllowedFormats(client);
+  return Boolean(allowed[format]);
+}
+
+function formatCheckboxChecked(client, format) {
+  return isFormatEnabled(client, format) ? "checked" : "";
+}
+
+function buildFormatLink(subBase, client, format, label) {
+  if (!isFormatEnabled(client, format)) {
+    return `<span class="disabled-link">${escapeHtml(label)} off</span>`;
+  }
+
+  const href = format === "raw" ? subBase : `${subBase}/${format}`;
+  return `<a href="${href}" target="_blank">${escapeHtml(label)}</a>`;
 }
 
 function buildInfoConfig(uuid, parsedInfo) {
@@ -345,7 +523,11 @@ function makeProxyTagsUnique(nodes) {
     used.set(baseName, count + 1);
 
     const uniqueName = count === 0 ? baseName : `${baseName} ${count + 1}`;
-    return { ...node, name: uniqueName, tag: `proxy-${index + 1}-${uniqueName}` };
+    return {
+      ...node,
+      name: uniqueName,
+      tag: `proxy-${index + 1}-${uniqueName}`,
+    };
   });
 }
 
@@ -355,7 +537,7 @@ function cleanProxyName(name) {
 
 function buildMihomoYaml(nodes, profileName) {
   const proxyNames = nodes.map((node) => node.name);
-  const autoGroupName = "Auto - Lowest Latency";
+  const autoGroupName = "♻️ Auto - Lowest Latency";
   const lines = [];
 
   lines.push(`mixed-port: 7890`);
@@ -372,17 +554,29 @@ function buildMihomoYaml(nodes, profileName) {
 
   lines.push(``);
   lines.push(`proxy-groups:`);
+
+  // Manual selector group. The auto latency group is first, so most clients will
+  // default to the lowest-latency choice while still allowing manual selection.
   lines.push(`  - name: ${yamlString(profileName || "EdgeSub")}`);
   lines.push(`    type: select`);
   lines.push(`    proxies:`);
   lines.push(`      - ${yamlString(autoGroupName)}`);
-  for (const name of proxyNames) lines.push(`      - ${yamlString(name)}`);
 
-  lines.push(``);
+  for (const name of proxyNames) {
+    lines.push(`      - ${yamlString(name)}`);
+  }
+
+  // Mihomo/Clash automatic latency balancer.
+  // interval: 180 means a 3-minute latency check interval.
+  // url-test selects the currently lowest-latency available proxy.
   lines.push(`  - name: ${yamlString(autoGroupName)}`);
   lines.push(`    type: url-test`);
   lines.push(`    proxies:`);
-  for (const name of proxyNames) lines.push(`      - ${yamlString(name)}`);
+
+  for (const name of proxyNames) {
+    lines.push(`      - ${yamlString(name)}`);
+  }
+
   lines.push(`    url: ${yamlString("http://www.gstatic.com/generate_204")}`);
   lines.push(`    interval: 180`);
   lines.push(`    tolerance: 50`);
@@ -409,7 +603,9 @@ function mihomoProxyToYamlLines(node) {
 
   if (node.alpn.length > 0) {
     lines.push(`    alpn:`);
-    for (const item of node.alpn) lines.push(`      - ${yamlString(item)}`);
+    for (const item of node.alpn) {
+      lines.push(`      - ${yamlString(item)}`);
+    }
   }
 
   if (node.network && node.network !== "tcp") {
@@ -418,6 +614,7 @@ function mihomoProxyToYamlLines(node) {
     if (node.network === "ws") {
       lines.push(`    ws-opts:`);
       lines.push(`      path: ${yamlString(node.path || "/")}`);
+
       if (node.host) {
         lines.push(`      headers:`);
         lines.push(`        Host: ${yamlString(node.host)}`);
@@ -437,13 +634,16 @@ function buildSingBoxConfig(nodes) {
   const proxyTags = nodes.map((node) => node.tag);
 
   return {
-    log: { level: "error", timestamp: true },
+    log: {
+      level: "error",
+      timestamp: true,
+    },
     inbounds: [
       {
         type: "mixed",
         tag: "mixed-in",
         listen: "127.0.0.1",
-        listen_port: 2080,
+        listen_port: 10808,
         sniff: true,
       },
     ],
@@ -488,11 +688,21 @@ function singBoxVlessOutbound(node) {
   if (node.flow) outbound.flow = node.flow;
 
   if (node.tls) {
-    outbound.tls = { enabled: true };
+    outbound.tls = {
+      enabled: true,
+    };
+
     if (node.sni) outbound.tls.server_name = node.sni;
     if (node.allowInsecure) outbound.tls.insecure = true;
     if (node.alpn.length > 0) outbound.tls.alpn = node.alpn;
-    if (node.fp) outbound.tls.utls = { enabled: true, fingerprint: node.fp };
+
+    if (node.fp) {
+      outbound.tls.utls = {
+        enabled: true,
+        fingerprint: node.fp,
+      };
+    }
+
     if (node.reality) {
       outbound.tls.reality = {
         enabled: true,
@@ -503,12 +713,23 @@ function singBoxVlessOutbound(node) {
   }
 
   if (node.network === "ws") {
-    outbound.transport = { type: "ws", path: node.path || "/" };
-    if (node.host) outbound.transport.headers = { Host: node.host };
+    outbound.transport = {
+      type: "ws",
+      path: node.path || "/",
+    };
+
+    if (node.host) {
+      outbound.transport.headers = {
+        Host: node.host,
+      };
+    }
   }
 
   if (node.network === "grpc") {
-    outbound.transport = { type: "grpc", service_name: node.serviceName || "" };
+    outbound.transport = {
+      type: "grpc",
+      service_name: node.serviceName || "",
+    };
   }
 
   return outbound;
@@ -516,20 +737,28 @@ function singBoxVlessOutbound(node) {
 
 function buildXrayLeastPingBalancerConfig(nodes) {
   return {
-    log: { loglevel: "error" },
+    log: {
+      loglevel: "error",
+    },
     dns: {
       hosts: {},
-      servers: ["1.1.1.1", "8.8.8.8"],
+      servers: [
+        "1.1.1.1",
+        "8.8.8.8",
+      ],
     },
     inbounds: [
       {
         tag: "socks",
-        port: 2080,
+        port: 10808,
         listen: "0.0.0.0",
         protocol: "mixed",
         sniffing: {
           enabled: true,
-          destOverride: ["http", "tls"],
+          destOverride: [
+            "http",
+            "tls",
+          ],
           routeOnly: true,
         },
         settings: {
@@ -551,19 +780,25 @@ function buildXrayLeastPingBalancerConfig(nodes) {
       ],
       balancers: [
         {
-          selector: ["proxy"],
+          selector: [
+            "proxy",
+          ],
           strategy: {
             type: "leastPing",
-            settings: { expected: 1 },
+            settings: {
+              expected: 1,
+            },
           },
           tag: "proxy-round",
         },
       ],
     },
     observatory: {
-      subjectSelector: ["proxy"],
+      subjectSelector: [
+        "proxy",
+      ],
       probeUrl: "http://detectportal.firefox.com/canonical.html",
-      probeInterval: "1m",
+      probeInterval: "3m",
       enableConcurrency: true,
     },
   };
@@ -581,7 +816,10 @@ function xrayVlessOutbound(node) {
   };
 
   if (node.tls) {
-    streamSettings.tlsSettings = { allowInsecure: Boolean(node.allowInsecure) };
+    streamSettings.tlsSettings = {
+      allowInsecure: Boolean(node.allowInsecure),
+    };
+
     if (node.sni) streamSettings.tlsSettings.serverName = node.sni;
     if (node.alpn.length > 0) streamSettings.tlsSettings.alpn = node.alpn;
     if (node.fp) streamSettings.tlsSettings.fingerprint = node.fp;
@@ -590,8 +828,11 @@ function xrayVlessOutbound(node) {
   if (node.network === "ws") {
     streamSettings.wsSettings = {
       path: node.path || "/",
-      headers: { "User-Agent": "chrome" },
+      headers: {
+        "User-Agent": "chrome",
+      },
     };
+
     if (node.host) {
       streamSettings.wsSettings.host = node.host;
       streamSettings.wsSettings.headers.Host = node.host;
@@ -599,7 +840,9 @@ function xrayVlessOutbound(node) {
   }
 
   if (node.network === "grpc") {
-    streamSettings.grpcSettings = { serviceName: node.serviceName || "" };
+    streamSettings.grpcSettings = {
+      serviceName: node.serviceName || "",
+    };
   }
 
   return {
@@ -613,7 +856,7 @@ function xrayVlessOutbound(node) {
           users: [
             {
               id: node.uuid,
-              email: "user@example.invalid",
+              email: "t@t.tt",
               security: "auto",
               encryption: node.encryption || "none",
               ...(node.flow ? { flow: node.flow } : {}),
@@ -623,7 +866,10 @@ function xrayVlessOutbound(node) {
       ],
     },
     streamSettings,
-    mux: { enabled: false, concurrency: -1 },
+    mux: {
+      enabled: false,
+      concurrency: -1,
+    },
   };
 }
 
@@ -651,6 +897,7 @@ function parseSubscriptionUserInfo(headerValue) {
 
     if (Number.isFinite(value) && key in result) {
       result[key] = value;
+
       if (key === "upload") result.hasUpload = true;
       if (key === "download") result.hasDownload = true;
       if (key === "total") result.hasTotal = true;
@@ -671,6 +918,7 @@ function formatRemainingTraffic(info) {
 
   const used = Math.max(0, info.upload + info.download);
   const remaining = Math.max(0, info.total - used);
+
   return formatBytes(remaining);
 }
 
@@ -680,6 +928,7 @@ function formatRemainingTrafficHeader(info) {
 
   const used = Math.max(0, info.upload + info.download);
   const remaining = Math.max(0, info.total - used);
+
   return formatBytes(remaining);
 }
 
@@ -690,6 +939,7 @@ function formatRemainingDays(info) {
   const nowSeconds = Math.floor(Date.now() / 1000);
   const remainingSeconds = info.expire - nowSeconds;
   const remainingDays = Math.max(0, Math.ceil(remainingSeconds / 86400));
+
   return `${remainingDays} days`;
 }
 
@@ -700,18 +950,21 @@ function formatRemainingDaysHeader(info) {
   const nowSeconds = Math.floor(Date.now() / 1000);
   const remainingSeconds = info.expire - nowSeconds;
   const remainingDays = Math.max(0, Math.ceil(remainingSeconds / 86400));
+
   return String(remainingDays);
 }
 
 function formatExpireTehran(info) {
   if (!info.hasExpire) return "expiry unknown";
   if (info.expire <= 0) return "no expiry";
+
   return `expires ${formatUnixSecondsInTehran(info.expire)} Tehran`;
 }
 
 function formatExpireTehranHeader(info) {
   if (!info.hasExpire) return "unknown";
   if (info.expire <= 0) return "no-expiry";
+
   return `${formatUnixSecondsInTehran(info.expire)} Asia/Tehran`;
 }
 
@@ -746,7 +999,7 @@ function formatBytes(bytes) {
   return `${value.toFixed(2)} ${units[unitIndex]}`;
 }
 
-async function handleAdminPage(request, env, adminPath) {
+async function handleAdminPage(request, env) {
   const url = new URL(request.url);
   const editId = url.searchParams.get("edit") || "";
   const clients = await listClients(env);
@@ -756,23 +1009,31 @@ async function handleAdminPage(request, env, adminPath) {
     clients,
     editingClient,
     message: url.searchParams.get("message") || "",
-    adminPath,
   });
 
   return htmlResponse(html);
 }
 
-async function handleSaveClient(request, env, adminPath) {
+async function handleSaveClient(request, env) {
   const form = await request.formData();
+
   const existingId = String(form.get("id") || "").trim();
   const uuid = String(form.get("uuid") || "").trim();
 
-  if (uuid && !isValidUuid(uuid)) return textResponse("Invalid UUID", 400);
+  if (uuid && !isValidUuid(uuid)) {
+    return textResponse("Invalid UUID", 400);
+  }
 
   const id = existingId || uuid || makeStorageId();
-  if (!isValidClientId(id)) return textResponse("Invalid client link ID", 400);
+  if (!isValidClientId(id)) {
+    return textResponse("Invalid client link ID", 400);
+  }
 
   const updateInterval = Number(form.get("updateInterval") || 6);
+  const configs = String(form.get("configs") || "").trim();
+  const submittedWorkerAddresses = String(form.get("workerAddresses") || "").trim();
+  const detectedWorkerAddresses = detectWorkerAddressesFromConfigs(configs);
+  const workerAddresses = submittedWorkerAddresses || detectedWorkerAddresses.join(", ");
 
   const client = {
     id,
@@ -780,37 +1041,47 @@ async function handleSaveClient(request, env, adminPath) {
     name: String(form.get("name") || "").trim() || id,
     title: String(form.get("title") || "").trim() || "EdgeSub",
     upstreamUrl: String(form.get("upstreamUrl") || "").trim(),
-    configs: String(form.get("configs") || "").trim(),
+    configs,
+    workerAddresses,
+    detectedWorkerAddresses,
+    workerReplaceEnabled: Boolean(submittedWorkerAddresses && form.get("workerReplaceEnabled") === "on"),
     enabled: form.get("enabled") === "on",
     showInfoConfig: form.get("showInfoConfig") === "on",
-    updateInterval: Number.isFinite(updateInterval) && updateInterval > 0 ? updateInterval : 6,
-    outputs: {
-      raw: form.get("output_raw") === "on",
-      ty: form.get("output_ty") === "on",
-      cl: form.get("output_cl") === "on",
-      sb: form.get("output_sb") === "on",
-      bl: form.get("output_bl") === "on",
+    allowedFormats: {
+      raw: form.get("allowRaw") === "on",
+      ty: form.get("allowTy") === "on",
+      cl: form.get("allowCl") === "on",
+      sb: form.get("allowSb") === "on",
+      bl: form.get("allowBl") === "on",
     },
+    updateInterval: Number.isFinite(updateInterval) && updateInterval > 0 ? updateInterval : 6,
     updatedAt: new Date().toISOString(),
   };
 
   await env.SUB_DB.put(clientKey(id), JSON.stringify(client, null, 2));
-  return redirect(`${adminPath}?message=${encodeURIComponent("Client saved")}`);
+  return redirect(`/admin?message=${encodeURIComponent("Client saved")}`);
 }
 
-async function handleDeleteClient(request, env, adminPath) {
+async function handleDeleteClient(request, env) {
   const form = await request.formData();
   const id = String(form.get("id") || form.get("uuid") || "").trim();
-  if (!isValidClientId(id)) return textResponse("Invalid client link ID", 400);
+
+  if (!isValidClientId(id)) {
+    return textResponse("Invalid client link ID", 400);
+  }
 
   await env.SUB_DB.delete(clientKey(id));
-  return redirect(`${adminPath}?message=${encodeURIComponent("Client deleted")}`);
+  return redirect(`/admin?message=${encodeURIComponent("Client deleted")}`);
 }
 
 async function getClient(env, id) {
   const value = await env.SUB_DB.get(clientKey(id), "json");
   if (!value) return null;
-  return { ...value, id: value.id || id };
+
+  return {
+    ...value,
+    id: value.id || id,
+  };
 }
 
 async function listClients(env) {
@@ -821,7 +1092,10 @@ async function listClients(env) {
     const client = await env.SUB_DB.get(key.name, "json");
     if (client) {
       const id = key.name.slice(CLIENT_PREFIX.length);
-      clients.push({ ...client, id: client.id || id });
+      clients.push({
+        ...client,
+        id: client.id || id,
+      });
     }
   }
 
@@ -833,23 +1107,14 @@ function clientKey(id) {
   return `${CLIENT_PREFIX}${id}`;
 }
 
-function isOutputEnabled(client, format) {
-  const outputs = client.outputs || DEFAULT_OUTPUTS;
-  if (!(format in DEFAULT_OUTPUTS)) return false;
-  if (typeof outputs[format] !== "boolean") return true;
-  return outputs[format];
-}
-
 function requireAdmin(request, env) {
-  const expectedUser = env.ADMIN_USER;
+  const expectedUser = env.ADMIN_USER || "admin";
   const expectedPass = env.ADMIN_PASS;
 
-  if (!expectedUser || !expectedPass) {
-    return textResponse("Admin credentials are not configured", 500);
-  }
-
   const header = request.headers.get("Authorization") || "";
-  if (!header.startsWith("Basic ")) return adminUnauthorized();
+  if (!header.startsWith("Basic ")) {
+    return adminUnauthorized();
+  }
 
   const encoded = header.slice("Basic ".length).trim();
   let decoded = "";
@@ -861,7 +1126,9 @@ function requireAdmin(request, env) {
   }
 
   const separatorIndex = decoded.indexOf(":");
-  if (separatorIndex === -1) return adminUnauthorized();
+  if (separatorIndex === -1) {
+    return adminUnauthorized();
+  }
 
   const user = decoded.slice(0, separatorIndex);
   const pass = decoded.slice(separatorIndex + 1);
@@ -898,7 +1165,7 @@ function adminUnauthorized() {
   });
 }
 
-function renderAdminPage({ clients, editingClient, message, adminPath }) {
+function renderAdminPage({ clients, editingClient, message }) {
   const client = editingClient || {
     id: "",
     uuid: "",
@@ -906,42 +1173,55 @@ function renderAdminPage({ clients, editingClient, message, adminPath }) {
     title: "EdgeSub",
     upstreamUrl: "",
     configs: "",
+    workerAddresses: "",
+    detectedWorkerAddresses: [],
+    workerReplaceEnabled: false,
     enabled: true,
     showInfoConfig: true,
+    allowedFormats: {
+      raw: true,
+      ty: true,
+      cl: true,
+      sb: true,
+      bl: true,
+    },
     updateInterval: 6,
-    outputs: { ...DEFAULT_OUTPUTS },
   };
 
-  const outputs = { ...DEFAULT_OUTPUTS, ...(client.outputs || {}) };
+  const displayWorkerAddresses = client.workerAddresses || detectWorkerAddressesFromConfigs(client.configs || "").join(", ");
+  const workerReplaceChecked = client.workerReplaceEnabled ? "checked" : "";
+  const activeCount = clients.filter((item) => item.enabled).length;
+  const storageCount = clients.filter((item) => !item.uuid).length;
+  const normalCount = Math.max(0, clients.length - storageCount);
+
   const rows = clients.map((item) => {
     const clientId = item.id || item.uuid;
     const subBase = `/sub/${encodeURIComponent(clientId)}`;
-    const editLink = `${adminPath}?edit=${encodeURIComponent(clientId)}`;
-    const itemOutputs = { ...DEFAULT_OUTPUTS, ...(item.outputs || {}) };
-
-    function outputLink(format, label, suffix = "") {
-      if (!itemOutputs[format]) return `<span class="disabled-output">${escapeHtml(label)}</span>`;
-      return `<a href="${subBase}${suffix}" target="_blank">${escapeHtml(label)}</a>`;
-    }
+    const editLink = `/admin?edit=${encodeURIComponent(clientId)}`;
+    const statusClass = item.enabled ? "status-on" : "status-off";
+    const statusText = item.enabled ? "Enabled" : "Disabled";
 
     return `
       <tr>
-        <td>${escapeHtml(item.name || clientId)}</td>
+        <td>
+          <div class="client-name">${escapeHtml(item.name || clientId)}</div>
+          <div class="client-sub">${escapeHtml(item.title || "EdgeSub")}</div>
+        </td>
         <td><code>${escapeHtml(clientId)}</code></td>
         <td><code>${escapeHtml(item.uuid || "storage-only")}</code></td>
-        <td>${item.enabled ? "Enabled" : "Disabled"}</td>
+        <td><span class="status ${statusClass}">${statusText}</span></td>
         <td class="links">
-          ${outputLink("raw", "xray")}
-          ${outputLink("ty", "base64", "/ty")}
-          ${outputLink("cl", "mihomo", "/cl")}
-          ${outputLink("sb", "sing-box", "/sb")}
-          ${outputLink("bl", "xray-balancer", "/bl")}
+          ${buildFormatLink(subBase, item, "raw", "xray")}
+          ${buildFormatLink(subBase, item, "ty", "base64")}
+          ${buildFormatLink(subBase, item, "cl", "mihomo")}
+          ${buildFormatLink(subBase, item, "sb", "sing-box")}
+          ${buildFormatLink(subBase, item, "bl", "balancer")}
         </td>
-        <td><a href="${editLink}">edit</a></td>
+        <td><a class="table-link" href="${editLink}">edit</a></td>
         <td>
-          <form method="post" action="${adminPath}/delete" onsubmit="return confirm('Delete this client?')">
+          <form method="post" action="/admin/delete" onsubmit="return confirm('Delete this client?')">
             <input type="hidden" name="id" value="${escapeHtml(clientId)}">
-            <button type="submit" class="danger">delete</button>
+            <button type="submit" class="danger ghost-button">delete</button>
           </form>
         </td>
       </tr>
@@ -953,47 +1233,319 @@ function renderAdminPage({ clients, editingClient, message, adminPath }) {
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>EdgeSub Manager</title>
+  <title>EdgeSub Subscription Manager</title>
   <style>
-    :root { font-family: Arial, sans-serif; color: #111; background: #f6f6f6; }
-    body { margin: 0; padding: 24px; }
-    main { max-width: 1180px; margin: 0 auto; }
-    h1, h2 { margin: 0 0 16px; }
-    section { background: #fff; border: 1px solid #ddd; border-radius: 12px; padding: 18px; margin-bottom: 20px; }
-    label { display: block; font-weight: 700; margin: 14px 0 6px; }
-    input[type="text"], input[type="url"], input[type="number"], textarea {
-      width: 100%; box-sizing: border-box; padding: 10px; border: 1px solid #ccc; border-radius: 8px; font: inherit;
+    :root {
+      --bg: #f7fbff;
+      --panel: #ffffff;
+      --panel-soft: #eef6ff;
+      --panel-blue: #e7f2ff;
+      --border: #d6e7f8;
+      --border-strong: #b9d8f4;
+      --text: #102033;
+      --muted: #60748a;
+      --blue: #2f80ed;
+      --blue-dark: #165ec9;
+      --blue-soft: #dceeff;
+      --danger: #c03636;
+      --danger-soft: #fff1f1;
+      --shadow: 0 18px 50px rgba(47, 128, 237, 0.10);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 20% 0%, rgba(47,128,237,0.10), transparent 28%),
+        linear-gradient(180deg, #fbfdff 0%, var(--bg) 100%);
     }
-    textarea { min-height: 220px; font-family: Consolas, monospace; }
-    button { padding: 9px 14px; border: 0; border-radius: 8px; background: #111; color: #fff; cursor: pointer; }
-    button.danger { background: #a00000; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { text-align: left; border-bottom: 1px solid #eee; padding: 10px; vertical-align: top; }
-    code { font-family: Consolas, monospace; }
-    .message { padding: 10px; border-radius: 8px; background: #e9ffe9; margin-bottom: 14px; }
-    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
-    .checkbox { display: flex; align-items: center; gap: 8px; font-weight: 400; margin-top: 14px; }
-    .help { color: #555; font-size: 14px; margin-top: 4px; }
-    .links { display: flex; gap: 8px; flex-wrap: wrap; }
-    .disabled-output { color: #999; text-decoration: line-through; }
-    @media (max-width: 800px) { .row { grid-template-columns: 1fr; } body { padding: 12px; } }
+
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 28px; min-height: 100vh; }
+    main { max-width: 1180px; margin: 0 auto; }
+
+    .hero {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 18px;
+      margin-bottom: 22px;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 12px;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--panel-soft);
+      color: var(--blue-dark);
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+
+    h1 {
+      margin: 12px 0 6px;
+      font-size: clamp(30px, 4vw, 52px);
+      line-height: 1;
+      letter-spacing: -0.04em;
+      color: var(--text);
+    }
+
+    .hero p { margin: 0; color: var(--muted); font-size: 15px; }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      min-width: 390px;
+    }
+
+    .summary-card {
+      background: linear-gradient(180deg, #ffffff 0%, var(--panel-blue) 100%);
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      padding: 16px;
+      box-shadow: var(--shadow);
+      text-align: center;
+    }
+
+    .summary-card strong {
+      display: block;
+      color: var(--blue);
+      font-size: 30px;
+      line-height: 1;
+      margin-bottom: 6px;
+    }
+
+    .summary-card span { color: var(--muted); font-size: 13px; font-weight: 700; }
+
+    section {
+      background: rgba(255,255,255,0.88);
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      padding: 22px;
+      margin-bottom: 20px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(12px);
+    }
+
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 18px;
+      padding-bottom: 14px;
+      border-bottom: 1px dashed var(--border-strong);
+    }
+
+    h2 { margin: 0; font-size: 22px; letter-spacing: -0.02em; }
+    .section-note { color: var(--muted); font-size: 14px; }
+
+    label { display: block; font-weight: 800; margin: 16px 0 7px; color: var(--text); }
+
+    input[type="text"], input[type="url"], input[type="number"], textarea {
+      width: 100%;
+      padding: 12px 13px;
+      border: 1px solid var(--border-strong);
+      border-radius: 14px;
+      background: #fff;
+      color: var(--text);
+      font: inherit;
+      outline: none;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+    }
+
+    input:focus, textarea:focus {
+      border-color: var(--blue);
+      box-shadow: 0 0 0 4px rgba(47,128,237,0.13);
+      background: #fcfeff;
+    }
+
+    textarea {
+      min-height: 220px;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 13px;
+      line-height: 1.55;
+      resize: vertical;
+    }
+
+    button, .button-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 10px 16px;
+      border: 0;
+      border-radius: 14px;
+      background: var(--blue);
+      color: #fff;
+      font-weight: 800;
+      text-decoration: none;
+      cursor: pointer;
+      box-shadow: 0 12px 24px rgba(47,128,237,0.20);
+    }
+
+    button:hover, .button-link:hover { background: var(--blue-dark); }
+    .danger { color: var(--danger); }
+    .ghost-button {
+      background: var(--danger-soft);
+      box-shadow: none;
+      color: var(--danger);
+      padding: 7px 10px;
+      border: 1px solid #ffd3d3;
+    }
+    .ghost-button:hover { background: #ffe5e5; color: #9b1f1f; }
+
+    table { width: 100%; border-collapse: separate; border-spacing: 0; overflow: hidden; }
+    th {
+      text-align: left;
+      padding: 12px;
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      background: var(--panel-soft);
+      border-bottom: 1px solid var(--border);
+    }
+    td {
+      text-align: left;
+      border-bottom: 1px solid #edf4fb;
+      padding: 13px 12px;
+      vertical-align: middle;
+      background: rgba(255,255,255,0.68);
+    }
+    tr:hover td { background: #f8fbff; }
+    code {
+      display: inline-block;
+      max-width: 260px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      vertical-align: bottom;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      font-size: 12px;
+      color: #264763;
+      background: #f2f8ff;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 5px 8px;
+    }
+
+    .message {
+      padding: 12px 14px;
+      border-radius: 16px;
+      background: #edf9f0;
+      border: 1px solid #cdeed4;
+      color: #1f7a3b;
+      font-weight: 700;
+      margin-bottom: 16px;
+    }
+
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    .checkbox {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-weight: 700;
+      margin-top: 16px;
+      padding: 12px 14px;
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      background: var(--panel-soft);
+    }
+    .checkbox input { width: 17px; height: 17px; accent-color: var(--blue); }
+    .help { color: var(--muted); font-size: 13px; margin-top: 5px; line-height: 1.45; }
+
+    .format-grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(130px, 1fr));
+      gap: 10px;
+      margin-top: 8px;
+    }
+
+    .client-name { font-weight: 800; color: var(--text); }
+    .client-sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+    .table-link, .links a {
+      display: inline-flex;
+      align-items: center;
+      padding: 5px 9px;
+      border-radius: 999px;
+      color: var(--blue-dark);
+      background: var(--blue-soft);
+      border: 1px solid var(--border-strong);
+      font-weight: 800;
+      font-size: 12px;
+      text-decoration: none;
+    }
+    .table-link:hover, .links a:hover { background: #cfe6ff; }
+    .links { display: flex; gap: 7px; flex-wrap: wrap; }
+    .disabled-link {
+      display: inline-flex;
+      align-items: center;
+      padding: 5px 9px;
+      border-radius: 999px;
+      color: #8796a6;
+      background: #f2f4f7;
+      border: 1px solid #e2e7ee;
+      font-size: 12px;
+      font-weight: 800;
+    }
+    .status {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 6px 10px;
+      font-size: 12px;
+      font-weight: 800;
+    }
+    .status-on { color: #1c7c45; background: #e9f9ef; border: 1px solid #c9efd6; }
+    .status-off { color: #8a5b00; background: #fff6df; border: 1px solid #ffe4a8; }
+
+    .actions { margin-top: 18px; display: flex; justify-content: flex-end; }
+    .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 18px; }
+
+    @media (max-width: 900px) {
+      body { padding: 14px; }
+      .hero { align-items: stretch; flex-direction: column; }
+      .summary-grid { min-width: 0; grid-template-columns: repeat(3, 1fr); }
+      .row, .format-grid { grid-template-columns: 1fr; }
+      section { padding: 16px; border-radius: 20px; }
+      code { max-width: 180px; }
+    }
   </style>
 </head>
 <body>
 <main>
-  <h1>EdgeSub Manager</h1>
+  <header class="hero">
+    <div>
+      <div class="eyebrow">✦ Edge subscription control</div>
+      <h1>EdgeSub Manager</h1>
+      <p>Minimal client, quota and subscription output management.</p>
+    </div>
+    <div class="summary-grid" aria-label="Subscription summary">
+      <div class="summary-card"><strong>${clients.length}</strong><span>Total clients</span></div>
+      <div class="summary-card"><strong>${activeCount}</strong><span>Active</span></div>
+      <div class="summary-card"><strong>${storageCount}</strong><span>Storage-only</span></div>
+    </div>
+  </header>
 
   ${message ? `<div class="message">${escapeHtml(message)}</div>` : ""}
 
   <section>
-    <h2>${editingClient ? "Edit client" : "Add client"}</h2>
-    <form method="post" action="${adminPath}/save">
+    <div class="section-head">
+      <div>
+        <h2>${editingClient ? "Edit client" : "Add client"}</h2>
+        <div class="section-note">Fill only what this subscription needs. Empty UUID keeps pasted configs unchanged.</div>
+      </div>
+    </div>
+
+    <form method="post" action="/admin/save">
       <input type="hidden" name="id" value="${escapeHtml(client.id || "")}">
 
       <div class="row">
         <div>
           <label for="name">Client name</label>
-          <input id="name" name="name" type="text" value="${escapeHtml(client.name)}" placeholder="Example User">
+          <input id="name" name="name" type="text" value="${escapeHtml(client.name)}" placeholder="Example Client">
         </div>
         <div>
           <label for="uuid">Client UUID</label>
@@ -1004,55 +1556,82 @@ function renderAdminPage({ clients, editingClient, message, adminPath }) {
 
       <label for="title">Profile title</label>
       <input id="title" name="title" type="text" value="${escapeHtml(client.title || "EdgeSub")}">
+      <div class="help">This is the subscription/profile name shown by apps that support it.</div>
 
-      <label for="upstreamUrl">Upstream subscription URL</label>
-      <input id="upstreamUrl" name="upstreamUrl" type="url" value="${escapeHtml(client.upstreamUrl)}" placeholder="https://panel.example.net:2096/sub/random-token">
+      <label for="upstreamUrl">3x-ui subscription URL</label>
+      <input id="upstreamUrl" name="upstreamUrl" type="url" value="${escapeHtml(client.upstreamUrl)}" placeholder="https://example.com/sub/example-token">
       <div class="help">Used only to read traffic and expiry headers. Leave empty for storage-only subscriptions.</div>
 
       <label for="configs">Manual configs</label>
       <textarea id="configs" name="configs" placeholder="One config per line">${escapeHtml(client.configs)}</textarea>
       <div class="help">If Client UUID is set, every UUID inside these configs will be replaced with the client's UUID. Converter outputs currently support VLESS links.</div>
 
+      <label for="workerAddresses">Worker addresses for host/SNI replacement</label>
+      <input id="workerAddresses" name="workerAddresses" type="text" value="${escapeHtml(displayWorkerAddresses)}" placeholder="worker-one.example.workers.dev, worker-two.example.workers.dev">
+      <div class="help">Separate multiple workers with commas. If empty, the Worker detects existing host/sni values from the configs and stores them here, but replacement stays disabled unless you enable it.</div>
+
+      <label class="checkbox">
+        <input type="checkbox" name="workerReplaceEnabled" ${workerReplaceChecked}>
+        Apply worker replacement and expand configs
+      </label>
+      <div class="help">When enabled, 30 input configs with 2 workers become 60 output configs. Only existing sni and host query parameters are replaced. Remarks are not changed.</div>
+
       <div class="row">
-        <label class="checkbox"><input type="checkbox" name="enabled" ${client.enabled ? "checked" : ""}> Enabled</label>
-        <label class="checkbox"><input type="checkbox" name="showInfoConfig" ${client.showInfoConfig ? "checked" : ""}> Add info config line to raw/base64 outputs</label>
+        <label class="checkbox">
+          <input type="checkbox" name="enabled" ${client.enabled ? "checked" : ""}>
+          Enabled
+        </label>
+
+        <label class="checkbox">
+          <input type="checkbox" name="showInfoConfig" ${client.showInfoConfig ? "checked" : ""}>
+          Add info config line to raw/base64 outputs
+        </label>
       </div>
 
-      <label>Available subscription outputs</label>
-      <div class="row">
-        <label class="checkbox"><input type="checkbox" name="output_raw" ${outputs.raw ? "checked" : ""}> Raw Xray links: /sub/ID</label>
-        <label class="checkbox"><input type="checkbox" name="output_ty" ${outputs.ty ? "checked" : ""}> Base64: /sub/ID/ty</label>
-        <label class="checkbox"><input type="checkbox" name="output_cl" ${outputs.cl ? "checked" : ""}> Mihomo: /sub/ID/cl</label>
-        <label class="checkbox"><input type="checkbox" name="output_sb" ${outputs.sb ? "checked" : ""}> sing-box: /sub/ID/sb</label>
-        <label class="checkbox"><input type="checkbox" name="output_bl" ${outputs.bl ? "checked" : ""}> Xray least-ping balancer: /sub/ID/bl</label>
+      <label>Available subscription outputs for this client</label>
+      <div class="format-grid">
+        <label class="checkbox"><input type="checkbox" name="allowRaw" ${formatCheckboxChecked(client, "raw")}> Xray raw</label>
+        <label class="checkbox"><input type="checkbox" name="allowTy" ${formatCheckboxChecked(client, "ty")}> Base64</label>
+        <label class="checkbox"><input type="checkbox" name="allowCl" ${formatCheckboxChecked(client, "cl")}> Mihomo</label>
+        <label class="checkbox"><input type="checkbox" name="allowSb" ${formatCheckboxChecked(client, "sb")}> sing-box</label>
+        <label class="checkbox"><input type="checkbox" name="allowBl" ${formatCheckboxChecked(client, "bl")}> Xray balancer</label>
       </div>
+      <div class="help">Disabled outputs return HTTP 403 and are shown as off in the client list.</div>
 
       <label for="updateInterval">Update interval, in hours</label>
       <input id="updateInterval" name="updateInterval" type="number" min="1" value="${escapeHtml(String(client.updateInterval || 6))}">
       <div class="help">Apps may use this as the recommended automatic refresh interval.</div>
 
-      <p><button type="submit">Save client</button></p>
+      <div class="actions"><button type="submit">Save client</button></div>
     </form>
   </section>
 
   <section>
-    <h2>Clients</h2>
-    <table>
-      <thead>
-        <tr>
-          <th>Name</th>
-          <th>Link ID</th>
-          <th>UUID</th>
-          <th>Status</th>
-          <th>Links</th>
-          <th>Edit</th>
-          <th>Delete</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${rows || `<tr><td colspan="7">No clients yet.</td></tr>`}
-      </tbody>
-    </table>
+    <div class="section-head">
+      <div>
+        <h2>Clients</h2>
+        <div class="section-note">${normalCount} UUID-based, ${storageCount} storage-only.</div>
+      </div>
+    </div>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Link ID</th>
+            <th>UUID</th>
+            <th>Status</th>
+            <th>Links</th>
+            <th>Edit</th>
+            <th>Delete</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows || `<tr><td colspan="7">No clients yet.</td></tr>`}
+        </tbody>
+      </table>
+    </div>
   </section>
 </main>
 </body>
@@ -1091,7 +1670,10 @@ function stripIpv6Brackets(value) {
 }
 
 function splitCsvParam(value) {
-  return safeDecodeURIComponent(value).split(",").map((item) => item.trim()).filter(Boolean);
+  return safeDecodeURIComponent(value)
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 function stringToBool(value) {
@@ -1127,7 +1709,10 @@ function escapeHtml(value) {
 function textResponse(body, status = 200, headers = {}) {
   return new Response(body, {
     status,
-    headers: { "Content-Type": "text/plain; charset=utf-8", ...headers },
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      ...headers,
+    },
   });
 }
 
@@ -1142,5 +1727,10 @@ function htmlResponse(body, status = 200) {
 }
 
 function redirect(location) {
-  return new Response(null, { status: 303, headers: { Location: location } });
+  return new Response(null, {
+    status: 303,
+    headers: {
+      Location: location,
+    },
+  });
 }
