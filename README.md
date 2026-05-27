@@ -1,140 +1,267 @@
 # EdgeSub Manager
 
-EdgeSub Manager is a Cloudflare Worker subscription manager for Xray-style proxy links.
+EdgeSub Manager is a single-file Cloudflare Worker subscription manager for proxy subscription links.
 
-It stores clients in Cloudflare KV, serves per-client subscription links, optionally reads traffic and expiry data from an upstream subscription URL, and can convert VLESS links into raw Xray links, Base64 subscriptions, Mihomo YAML, sing-box JSON, and an Xray least-ping balancer JSON.
+It lets you manage clients from a small web panel, store manual subscription configs in Cloudflare KV, expose multiple subscription output formats, and optionally read traffic/expiry information from an upstream panel subscription link.
 
-The project is designed to be self-hosted on Cloudflare Workers.
+The project is designed for Cloudflare Workers and Cloudflare KV.
 
 ## Features
 
-- Admin panel protected by Basic Auth.
-- Cloudflare KV client database.
-- Per-client manual config storage.
-- Optional upstream subscription URL for traffic and expiry headers.
-- Safe UUID replacement rules.
-- Storage-only subscriptions.
-- Per-client output enable/disable switches.
-- Raw Xray/VLESS subscription output.
-- Base64 encoded subscription output.
-- Mihomo YAML output with selector and `url-test` latency balancer.
-- sing-box JSON output.
-- Xray JSON least-ping balancer output.
-- No bundled routing rules, direct rules, block rules, or rule providers.
+- Cloudflare Worker-based subscription manager
+- Cloudflare KV client storage
+- Minimal web admin panel
+- Per-client enable/disable switch
+- Per-client subscription output controls
+- Optional upstream subscription URL for usage/expiry headers
+- Optional storage-only subscriptions
+- Optional UUID replacement
+- Raw Xray/VLESS subscription output
+- Base64 subscription output
+- Mihomo/Clash YAML output
+- sing-box JSON output
+- Xray least-ping balancer JSON output
+- Mihomo `url-test` auto-latency group
+- Readable custom traffic/expiry headers
 
-## Endpoints
+## **Worker Replacer Feature**
 
-Assuming the Worker is deployed at:
+**EdgeSub Manager includes a Worker Replacer feature for Cloudflare Worker-style proxy configs.**
+
+This feature can replace the `host` and `sni` query parameters inside pasted configs with one or more Worker hostnames.
+
+Example Worker input in the admin panel:
 
 ```txt
-https://example-sub-worker.example.workers.dev
+worker-one.example.workers.dev, worker-two.example.workers.dev
 ```
 
-The subscription endpoints are:
+If a client has 30 manual configs and 2 Worker addresses, the output can become 60 configs:
 
 ```txt
-/sub/CLIENT_ID        Raw Xray/VLESS subscription links
-/sub/CLIENT_ID/ty     Base64 encoded raw subscription
-/sub/CLIENT_ID/cl     Mihomo YAML
-/sub/CLIENT_ID/sb     sing-box JSON
-/sub/CLIENT_ID/bl     Xray least-ping balancer JSON
-/client/CLIENT_ID     Backward-compatible raw subscription alias
+30 input configs × 2 Worker addresses = 60 output configs
 ```
 
-The admin panel is:
+The replacement behavior is intentionally conservative:
+
+- **Only existing `host` parameters are replaced.**
+- **Only existing `sni` parameters are replaced.**
+- **Remarks are not changed.**
+- **UUIDs are handled separately by the UUID setting.**
+- **If the Worker address box is empty, the original Worker/SNI/host values are kept unchanged.**
+- **If Worker replacement is disabled, stored Worker addresses are not applied.**
+
+This makes it possible to use one set of template configs and generate multiple Worker-host variants automatically.
+
+## Subscription Endpoints
+
+For a client with this ID:
+
+```txt
+CLIENT_ID
+```
+
+the Worker exposes:
+
+```txt
+/sub/CLIENT_ID       Raw Xray/VLESS links
+/sub/CLIENT_ID/ty    Base64-encoded raw subscription
+/sub/CLIENT_ID/cl    Mihomo/Clash YAML
+/sub/CLIENT_ID/sb    sing-box JSON
+/sub/CLIENT_ID/bl    Xray least-ping balancer JSON
+```
+
+A legacy raw alias may also be available:
+
+```txt
+/client/CLIENT_ID
+```
+
+## Admin Panel
+
+Default admin path:
 
 ```txt
 /admin
 ```
 
-You can change the admin path with `ADMIN_PATH` in `wrangler.toml`.
+Depending on your fork or deployment, the admin path may be changed in the Worker code or through an environment variable.
 
-## How client records work
+The admin panel lets you configure:
 
-Each client has:
+- Client name
+- Client UUID
+- Upstream subscription URL
+- Manual configs
+- Enabled/disabled state
+- Available output formats
+- Update interval
+- Optional INFO config
+- Worker replacement settings
+- Worker addresses
 
-- client name
-- optional client UUID
-- optional upstream subscription URL
-- manual configs, one per line
-- profile title
-- enabled/disabled status
-- optional INFO config for raw/Base64 output
-- update interval
-- enabled output formats
+## UUID Behavior
 
-### UUID behavior
+The UUID box controls whether pasted configs are rewritten.
 
-If the Client UUID field is filled, every UUID found inside the manual configs is replaced with that client UUID.
+If the Client UUID box is filled:
 
-If the Client UUID field is empty, manual configs are served exactly as stored. This is useful for storage-only subscriptions.
+```txt
+All UUIDs inside manual configs are replaced with that UUID.
+```
 
-If the Client UUID field is empty but the upstream subscription URL is filled, the Worker still fetches traffic and expiry headers from the upstream link, but does not touch UUIDs inside manual configs.
+If the Client UUID box is empty:
 
-## Traffic and expiry data
+```txt
+Manual configs are returned without changing their UUIDs.
+```
 
-The Worker fetches the upstream subscription URL and reads:
+This is useful for storage-only subscriptions.
+
+Important behavior:
+
+```txt
+UUID box empty + upstream subscription URL filled
+= traffic/expiry is fetched from upstream,
+but UUIDs inside manual configs are not touched.
+```
+
+## Storage-Only Subscriptions
+
+A storage-only subscription is a client entry without a Client UUID.
+
+Use this when you want EdgeSub Manager to store and serve pasted configs exactly as they are.
+
+For storage-only subscriptions:
+
+- The Worker creates an internal link ID.
+- UUIDs in manual configs are not changed.
+- Worker replacement only applies if explicitly enabled.
+- Upstream traffic/expiry can still be fetched if an upstream subscription URL is provided.
+
+## Traffic and Expiry Headers
+
+If an upstream subscription URL is configured, EdgeSub Manager fetches it and reads:
 
 ```http
 Subscription-Userinfo: upload=...; download=...; total=...; expire=...
 ```
 
-The Worker forwards this standard header to clients and also adds readable helper headers:
+The same header is returned to compatible clients.
+
+Additional readable headers are also returned:
 
 ```http
-X-EdgeSub-Remaining-Traffic: infinite
-X-EdgeSub-Expire-Tehran: 2026-06-20 14:30:00 Asia/Tehran
-X-EdgeSub-Remaining-Days: 26
+X-EdgeSub-Remaining-Traffic: ...
+X-EdgeSub-Expire-Time: ...
+X-EdgeSub-Remaining-Days: ...
 ```
 
-For compatibility, the standard `Subscription-Userinfo` header remains numeric. Infinite traffic is shown as `∞` only in the optional INFO config remark.
+Some apps may show usage/expiry information from `Subscription-Userinfo`. Support depends on the client app.
 
-## Mihomo output
+## Mihomo Output
 
-The `/cl` output returns a minimal Mihomo YAML with:
+The Mihomo output is available at:
 
-- `proxies`
-- a manual `select` group
-- an automatic `url-test` group
-
-The automatic group checks latency every 180 seconds, which is 3 minutes:
-
-```yaml
-proxy-groups:
-  - name: "EdgeSub"
-    type: select
-    proxies:
-      - "Auto - Lowest Latency"
-      - "Example Proxy 1"
-      - "Example Proxy 2"
-
-  - name: "Auto - Lowest Latency"
-    type: url-test
-    proxies:
-      - "Example Proxy 1"
-      - "Example Proxy 2"
-    url: "http://www.gstatic.com/generate_204"
-    interval: 180
-    tolerance: 50
+```txt
+/sub/CLIENT_ID/cl
 ```
 
-No rules are appended.
+It generates a minimal YAML profile with:
 
-## Requirements
+- proxy entries
+- a manual selector group
+- a `url-test` auto-latency group
+- 3-minute latency check interval
 
-- Node.js
+The `url-test` group checks latency and selects the lowest-latency proxy.
+
+No extra direct/block/custom routing rules are appended by default.
+
+## sing-box Output
+
+The sing-box output is available at:
+
+```txt
+/sub/CLIENT_ID/sb
+```
+
+It generates a minimal JSON config with:
+
+- mixed inbound
+- selector outbound
+- urltest outbound
+- generated VLESS outbounds
+- final route through the proxy selector
+
+No extra custom rules are appended by default.
+
+## Xray Least-Ping Balancer Output
+
+The Xray balancer output is available at:
+
+```txt
+/sub/CLIENT_ID/bl
+```
+
+It generates a JSON config with:
+
+- mixed inbound
+- generated VLESS outbounds
+- `leastPing` balancer
+- observatory
+- minimal routing rule to use the balancer
+
+No custom direct/block/domain rules are appended by default.
+
+## Supported Input Links
+
+Current converter support focuses on VLESS links.
+
+Supported parsed fields include:
+
+- UUID
+- server
+- port
+- security/TLS
+- SNI
+- host
+- path
+- ALPN
+- fingerprint
+- insecure/allowInsecure
+- WebSocket transport
+- gRPC transport
+
+Other protocols can still be served in raw output, but converter outputs may ignore unsupported link types.
+
+## Cloudflare Requirements
+
+You need:
+
 - Cloudflare account
-- Wrangler CLI
-- Cloudflare Workers KV namespace
+- Cloudflare Worker
+- Cloudflare KV namespace
+- KV binding named `SUB_DB`
+- Admin username variable
+- Admin password secret
 
-## Installation
+Required KV binding:
 
-Clone the repository:
-
-```bash
-git clone https://github.com/example-user/edgesub-manager.git
-cd edgesub-manager
+```txt
+SUB_DB
 ```
+
+Example environment variables:
+
+```txt
+ADMIN_USER=admin
+ADMIN_PASS=use-a-secret-not-plaintext
+```
+
+Use a secret for the password.
+
+## Deploy with Wrangler
 
 Install dependencies:
 
@@ -142,38 +269,24 @@ Install dependencies:
 npm install
 ```
 
-Copy the example Wrangler config:
-
-```bash
-cp wrangler.example.toml wrangler.toml
-```
-
-Create a KV namespace:
+Create KV:
 
 ```bash
 npx wrangler kv namespace create SUB_DB
 ```
 
-Copy the returned namespace ID into `wrangler.toml`:
+Copy the example config:
 
-```toml
-[[kv_namespaces]]
-binding = "SUB_DB"
-id = "PASTE_YOUR_KV_NAMESPACE_ID_HERE"
+```bash
+cp wrangler.example.toml wrangler.toml
 ```
+
+Add your KV namespace ID to `wrangler.toml`.
 
 Set the admin password as a secret:
 
 ```bash
 npx wrangler secret put ADMIN_PASS
-```
-
-Set a long random password when prompted.
-
-Check syntax:
-
-```bash
-npm run check
 ```
 
 Deploy:
@@ -182,137 +295,74 @@ Deploy:
 npm run deploy
 ```
 
-Open the admin panel:
+## Deploy from Cloudflare Dashboard
 
-```txt
-https://YOUR-WORKER.workers.dev/admin
-```
+You can also deploy from inside the Cloudflare dashboard.
 
-Use:
+General steps:
 
-```txt
-username: admin
-password: the secret you set with wrangler
-```
+1. Open Cloudflare dashboard.
+2. Go to **Workers & Pages**.
+3. Create a new Worker.
+4. Open the online code editor.
+5. Paste the contents of `src/worker.js`.
+6. Save and deploy.
+7. Create a KV namespace.
+8. Bind the KV namespace to the Worker as `SUB_DB`.
+9. Add `ADMIN_USER` as a variable.
+10. Add `ADMIN_PASS` as a secret.
+11. Open the admin path and log in.
 
-## Example client setup
-
-Normal UUID-rewrite client:
-
-```txt
-Client name: Example User
-Client UUID: 6f6a2f6d-8e42-4ef3-bf21-3ef9e57b0a01
-Upstream subscription URL: https://panel.example.net:2096/sub/example-token
-Manual configs:
-vless://11111111-1111-4111-8111-111111111111@example.net:443?encryption=none&security=tls&type=ws&host=worker.example.net&path=%2Fdownload#Example-Proxy
-```
-
-The output will replace the UUID inside the manual config with:
-
-```txt
-6f6a2f6d-8e42-4ef3-bf21-3ef9e57b0a01
-```
-
-Storage-only client:
-
-```txt
-Client name: Storage Example
-Client UUID: leave empty
-Upstream subscription URL: optional
-Manual configs: paste configs exactly as you want them returned
-```
-
-## Testing
-
-Raw output:
-
-```bash
-curl -L "https://YOUR-WORKER.workers.dev/sub/CLIENT_ID"
-```
-
-Base64:
-
-```bash
-curl -L "https://YOUR-WORKER.workers.dev/sub/CLIENT_ID/ty"
-```
-
-Mihomo:
-
-```bash
-curl -L "https://YOUR-WORKER.workers.dev/sub/CLIENT_ID/cl"
-```
-
-sing-box:
-
-```bash
-curl -L "https://YOUR-WORKER.workers.dev/sub/CLIENT_ID/sb"
-```
-
-Xray least-ping balancer:
-
-```bash
-curl -L "https://YOUR-WORKER.workers.dev/sub/CLIENT_ID/bl"
-```
-
-Headers:
-
-```bash
-curl -I "https://YOUR-WORKER.workers.dev/sub/CLIENT_ID"
-```
-
-
-## Cloudflare dashboard-only deployment
-
-If you do not want to use Wrangler, follow the dashboard tutorial here:
+See:
 
 ```txt
 docs/CLOUDFLARE_DASHBOARD_DEPLOY.md
 ```
 
-This method uses the Cloudflare Workers online editor, a KV namespace binding named `SUB_DB`, and dashboard Variables/Secrets for `ADMIN_USER`, `ADMIN_PASS`, and optional `ADMIN_PATH`.
+for the full dashboard deployment tutorial.
 
-## GitHub upload tutorial
+## Security Notes
 
-### Option A: GitHub CLI
+Before publishing or deploying:
 
-Create the local repository:
+- Do not commit real admin passwords.
+- Do not commit real subscription links.
+- Do not commit private domains unless you intentionally want them public.
+- Do not commit real client UUIDs.
+- Use placeholders in screenshots and examples.
+- Use `ADMIN_PASS` as a Worker secret.
 
-```bash
-git init
-git add .
-git commit -m "Initial open source release"
+Recommended placeholder examples:
+
+```txt
+example.com
+worker-one.example.workers.dev
+00000000-0000-4000-8000-000000000000
+CLIENT_ID
+admin
+change-this-password
 ```
 
-Create and push the GitHub repository:
+## Repository Structure
 
-```bash
-gh repo create edgesub-manager --public --source . --remote origin --push
-```
-
-### Option B: Browser + Git
-
-1. Create a new empty repository on GitHub.
-2. Do not add a README, `.gitignore`, or license from the browser if you already have these files locally.
-3. Copy the repository URL.
-4. Run:
-
-```bash
-git init
-git add .
-git commit -m "Initial open source release"
-git branch -M main
-git remote add origin https://github.com/YOUR-USERNAME/edgesub-manager.git
-git push -u origin main
+```txt
+edgesub-manager/
+├── src/
+│   └── worker.js
+├── docs/
+│   ├── CLOUDFLARE_DASHBOARD_DEPLOY.md
+│   └── OPEN_SOURCE_CHECKLIST.md
+├── README.md
+├── LICENSE
+├── SECURITY.md
+├── package.json
+├── wrangler.example.toml
+├── .env.example
+└── .gitignore
 ```
 
 ## License
 
-This repository includes the MIT License.
+MIT License.
 
-Before publishing, replace `Example Maintainers` in `LICENSE` with your GitHub username, organization, or preferred copyright holder.
-
-If you copy code from other projects, check their licenses first and preserve any required notices.
-
-## Disclaimer
-
-This project is a generic subscription-management tool. You are responsible for how you deploy and use it. Do not commit private subscription URLs, real client identifiers, passwords, tokens, or other secrets.
+You may use, modify, distribute, and publish the project under the terms of the license.
