@@ -6,6 +6,9 @@ It lets you manage clients from a small web panel, store manual subscription con
 
 The project is designed for Cloudflare Workers and Cloudflare KV.
 
+<img width="1918" height="871" alt="image" src="https://github.com/user-attachments/assets/c532b8e7-29f1-448c-a64e-8931515b8129" />
+
+
 ## Features
 
 - Cloudflare Worker-based subscription manager
